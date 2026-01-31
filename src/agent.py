@@ -403,7 +403,7 @@ Try using `cat` to view the exact current content of the file, then create a new
             for attempt in range(max_retries):
                 try:
                     completion = litellm.completion(
-                        model="gemini/gemini-2.5-flash-lite",
+                        model="gemini/gemini-2.5-flash", #gemini/gemini-2.5-flash-lite",
                         messages=self.messages,
                         response_format={"type": "json_object"},
                     )
