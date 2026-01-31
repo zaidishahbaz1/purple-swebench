@@ -406,7 +406,6 @@ Try using `cat` to view the exact current content of the file, then create a new
                         model="gemini/gemini-2.5-flash", #gemini/gemini-2.5-flash-lite",
                         messages=self.messages,
                         temperature=0,
-                        seed=42,
                         response_format={"type": "json_object"},
                     )
                     response = completion.choices[0].message.content
