@@ -1,0 +1,32 @@
+{
+  manifest_version: "0.1.0",
+  config_schema: {
+    type: "object",
+    properties: {
+      openrouter_api_key: {
+        type: "string",
+        title: "OpenRouter API Key",
+        secret: true,
+      },
+    },
+    required: ["openrouter_api_key"],
+    additionalProperties: false,
+  },
+  program: {
+    image: "ghcr.io/zaidishahbaz1/purple-swebench:latest",
+    entrypoint: "uv run --no-sync src/server.py --host 0.0.0.0 --port 9009",
+    env: {
+      PYTHONUNBUFFERED: "1",
+      OPENROUTER_API_KEY: "${config.openrouter_api_key}",
+    },
+    network: {
+      endpoints: [
+        { name: "endpoint", port: 9009 },
+      ],
+    },
+  },
+  provides: {
+    a2a: { kind: "a2a", endpoint: "endpoint" },
+  },
+  exports: { a2a: "a2a" },
+}
