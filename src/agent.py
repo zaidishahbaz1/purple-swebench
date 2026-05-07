@@ -43,8 +43,9 @@ Critical rules:
 - Output ONLY the JSON object. No prose, no markdown fences, no explanation.
 - Use real file paths consistent with the named repository.
 - Provide enough context lines (3 above + 3 below changes) for the hunk to apply.
-- If you can't produce a confident patch, return {"patch": ""} — empty is better than wrong.
 - Do not break existing tests. Make the minimal change.
+- NEVER return an empty patch. You MUST attempt a fix even when uncertain. A wrong-but-plausible patch that touches the right area is strictly better than no patch — wrong patches sometimes accidentally pass tests, and at worst score the same as empty.
+- Reason through the issue: identify the symptom, hypothesize the buggy file/function based on the repo's conventional layout, and propose a minimal change that addresses the symptom. Pick a concrete file path and produce the diff even if your confidence is low.
 """
 
 
@@ -174,7 +175,7 @@ class Agent:
             try:
                 completion = await asyncio.to_thread(
                     litellm.completion,
-                    model="gemini/gemini-2.5-flash",
+                    model="gemini/gemini-2.5-pro",
                     messages=[
                         {"role": "system", "content": SYSTEM_PROMPT},
                         {"role": "user", "content": user_prompt},
