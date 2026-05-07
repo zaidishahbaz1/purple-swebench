@@ -13,7 +13,13 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import random
 import re
+
+PROBLEM_MAX_CHARS = 4000
+HINTS_MAX_CHARS = 1000
+RETRY_MAX_ATTEMPTS = 15
+RETRY_BACKOFF_CAP = 30  # seconds
 
 from a2a.server.tasks import TaskUpdater
 from a2a.types import Message, Part, TaskState, TextPart
@@ -49,9 +55,18 @@ Critical rules:
 """
 
 
+def _truncate(text: str, limit: int) -> str:
+    if len(text) <= limit:
+        return text
+    return text[:limit] + f"\n\n[... truncated {len(text) - limit} chars ...]"
+
+
 def _build_user_prompt(task: dict) -> str:
-    problem = task.get("problem_statement", "").strip()
-    hints = (task.get("hints") or task.get("hints_text") or "").strip()
+    problem = _truncate(task.get("problem_statement", "").strip(), PROBLEM_MAX_CHARS)
+    hints = _truncate(
+        (task.get("hints") or task.get("hints_text") or "").strip(),
+        HINTS_MAX_CHARS,
+    )
     repo = task.get("repo", "").strip()
     base_commit = task.get("base_commit", "").strip()
 
@@ -170,28 +185,44 @@ class Agent:
         )
 
     async def _call_model(self, user_prompt: str) -> str:
-        max_retries = 5
-        for attempt in range(max_retries):
+        # Spread initial fan-out across shards to avoid synchronized burst.
+        await asyncio.sleep(random.uniform(0, 5))
+
+        # System prompt with cache_control so subsequent calls in the same
+        # shard pay 1/10th the input cost on the system block.
+        system_msg = {
+            "role": "system",
+            "content": [
+                {
+                    "type": "text",
+                    "text": SYSTEM_PROMPT,
+                    "cache_control": {"type": "ephemeral"},
+                }
+            ],
+        }
+        user_msg = {"role": "user", "content": user_prompt}
+
+        for attempt in range(RETRY_MAX_ATTEMPTS):
             try:
                 completion = await asyncio.to_thread(
                     litellm.completion,
                     model="anthropic/claude-haiku-4-5-20251001",
-                    messages=[
-                        {"role": "system", "content": SYSTEM_PROMPT},
-                        {"role": "user", "content": user_prompt},
-                    ],
+                    messages=[system_msg, user_msg],
                     temperature=0,
                     max_tokens=8192,
                 )
                 return completion.choices[0].message.content or ""
             except Exception as e:
                 err = str(e)
-                if any(s in err for s in ("503", "overloaded", "429", "rate")):
-                    wait = (2 ** attempt) * 5
-                    logger.warning(f"retry {attempt + 1}/{max_retries} in {wait}s: {err[:200]}")
+                if any(s in err for s in ("503", "overloaded", "429", "rate", "limit")):
+                    base = min(RETRY_BACKOFF_CAP, 5 * (2 ** min(attempt, 3)))
+                    wait = base + random.uniform(0, base * 0.3)  # jitter
+                    logger.warning(
+                        f"retry {attempt + 1}/{RETRY_MAX_ATTEMPTS} in {wait:.1f}s: {err[:200]}"
+                    )
                     await asyncio.sleep(wait)
                     continue
-                logger.error(f"LLM call failed: {err}")
+                logger.error(f"LLM call failed (non-retryable): {err}")
                 return ""
         logger.error("LLM call exhausted retries")
         return ""
