@@ -175,14 +175,13 @@ class Agent:
             try:
                 completion = await asyncio.to_thread(
                     litellm.completion,
-                    model="gemini/gemini-2.5-pro",
+                    model="anthropic/claude-haiku-4-5-20251001",
                     messages=[
                         {"role": "system", "content": SYSTEM_PROMPT},
                         {"role": "user", "content": user_prompt},
                     ],
                     temperature=0,
                     max_tokens=8192,
-                    response_format={"type": "json_object"},
                 )
                 return completion.choices[0].message.content or ""
             except Exception as e:
