@@ -1,5 +1,7 @@
 {
-  manifest_version: "0.1.0",
+  manifest_version: "0.3.0",
+  experimental_features: ["docker"],
+
   config_schema: {
     type: "object",
     properties: {
