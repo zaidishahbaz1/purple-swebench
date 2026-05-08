@@ -1,29 +1,23 @@
 """
-SWE-bench Pro Purple Agent — code-exploring single-shot patch generation.
+SWE-bench Pro Purple Agent — explore, patch, run tests, iterate.
 
-Flow per task:
-  1. Receive task: {instance_id, problem_statement, image_uri, base_commit, repo, hints}
-  2. Pull image_uri and start a container (the SWE-bench instance image already
-     contains the repo checked out at base_commit at /app).
-  3. LLM call #1: given issue + file tree, list 1-5 candidate files most likely
-     to contain the bug.
-  4. cat those files inside the container.
-  5. LLM call #2: given issue + actual file contents, produce a unified diff
-     with REAL line numbers from the actual code.
-  6. Validate via `git apply --check` inside the container.
-  7. If invalid, one repair LLM call with the validation error.
-  8. Return {"patch": <validated diff>}.
-  9. Stop container.
-
-This sidesteps the line-number-hallucination failure mode that pinned previous
-runs at 0% — the model sees real code and writes real line numbers.
+Per-task flow:
+  1. Pull image_uri, start a sidecar container (repo at /app, base_commit checked out)
+  2. LLM call #1: from issue + repo file tree, pick 2-4 source files + 1-2 test files
+  3. Read those files inside the container
+  4. LLM call #2: generate unified-diff patch (model now sees expected behavior in tests)
+  5. Validate via git apply --check; one repair attempt if invalid
+  6. Apply patch and run pytest on the candidate test files
+  7. If tests pass: done. Else: feed test output back to LLM, ask for revised patch
+  8. Up to 2 revision passes (3 LLM patch generations total)
+  9. Reset repo between iterations so each patch starts from base_commit
+ 10. Return the validated patch from the most successful attempt
 """
 from __future__ import annotations
 
 import asyncio
 import json
 import logging
-import os
 import random
 import re
 import subprocess
@@ -42,66 +36,82 @@ load_dotenv()
 logger = logging.getLogger(__name__)
 
 MODEL = "anthropic/claude-haiku-4-5-20251001"
-MAX_TOKENS = 8192
+MAX_TOKENS = 4096
 
 # Resource caps
 PROBLEM_MAX_CHARS = 4000
 HINTS_MAX_CHARS = 800
 FILE_TREE_MAX_LINES = 600
-FILE_CONTENT_MAX_CHARS = 30000  # per file
-NUM_CANDIDATE_FILES = 4
+FILE_CONTENT_MAX_CHARS = 20000
+NUM_SOURCE_FILES = 4
+NUM_TEST_FILES = 2
+TEST_OUTPUT_MAX_CHARS = 4000
 RETRY_MAX_ATTEMPTS = 12
 RETRY_BACKOFF_CAP = 30
-
-# Container settings
-CONTAINER_LIFETIME_SEC = 1800  # 30 min ceiling per task
+MAX_REVISION_PASSES = 2  # initial + 2 revisions = 3 patch attempts
 EXEC_TIMEOUT = 60
+TEST_RUN_TIMEOUT = 240
+CONTAINER_LIFETIME_SEC = 1800
 
 
 SYSTEM_FILE_ID = """You are an expert software engineer triaging a bug.
 
-You will be shown an issue and a list of files in the repository. Your job is
-to identify which files most likely contain the bug or need modification.
+You will see an issue and the repository's file tree. Pick the files most likely
+to contain the bug AND the test files that exercise the buggy behavior.
 
 Respond with a single JSON object:
-  {"files": ["path/to/file1.py", "path/to/file2.py"]}
+  {"source_files": ["path/to/src1.py", "path/to/src2.py"],
+   "test_files":   ["path/to/test_foo.py"]}
 
 Rules:
-- Pick 1 to 4 paths. Fewer is better if you're confident.
-- Use real paths from the file listing only. Do not invent paths.
-- Prefer source files over test files.
-- Output ONLY the JSON object, no prose."""
+- 1-4 source files, 0-2 test files.
+- Use real paths from the listing only — do not invent.
+- Test files: prefer ones whose names match the issue's keywords or the source files.
+- Output ONLY the JSON object."""
 
 
 SYSTEM_PATCH_GEN = """You are an expert software engineer fixing a bug.
 
-You will be shown an issue and the ACTUAL CONTENTS of the files most likely
-to contain the bug. Your job is to produce a unified-diff patch that fixes
-the issue, using REAL line numbers from the code shown.
+You will see:
+- An issue description
+- ACTUAL CONTENTS of the source files
+- ACTUAL CONTENTS of the relevant test files (these encode the expected behavior)
 
-Respond with a single JSON object:
-  {"patch": "<unified diff>"}
+Your job: produce a unified-diff patch that fixes the bug AND makes the relevant
+tests pass.
 
-The "patch" string must be a valid unified diff that `git apply` accepts:
-- Use the exact file paths from the headers shown to you.
-- Compute line numbers from the file content you've been shown — they must match.
+Respond with a single JSON object: {"patch": "<unified diff>"}
+
+Rules:
+- The patch must be a valid unified diff that `git apply` accepts.
+- Use the exact file paths shown to you. Compute line numbers from the file
+  content shown — they MUST match.
 - Include 3 lines of context above and below each change.
-- Make minimal changes; don't break existing tests.
-- Output ONLY the JSON object, no prose, no markdown fences.
-
-Example:
-{"patch": "diff --git a/path/to/file.py b/path/to/file.py\\n--- a/path/to/file.py\\n+++ b/path/to/file.py\\n@@ -10,7 +10,7 @@\\n context line\\n context line\\n context line\\n-old line\\n+new line\\n context line\\n context line\\n context line\\n"}"""
+- Look at the test files: they tell you what behavior is expected. Make the
+  source code conform to that expected behavior.
+- Output ONLY the JSON object, no prose."""
 
 
-SYSTEM_PATCH_REPAIR = """You wrote a patch that failed `git apply --check`. The error is below.
+SYSTEM_PATCH_REVISE = """Your previous patch was applied but the tests still fail.
 
-Common issues:
+You will see:
+- The original issue
+- The source and test file contents
+- Your previous patch
+- The test failure output
+
+Identify why your fix didn't work and produce a revised patch.
+
+Respond with the SAME JSON shape: {"patch": "<corrected unified diff>"}.
+Output ONLY the JSON object."""
+
+
+SYSTEM_PATCH_REPAIR = """Your previous patch failed `git apply --check`. Common issues:
 - Wrong line numbers in the @@ header
-- Context lines don't match the file exactly (whitespace, tab vs spaces)
+- Context lines don't exactly match the file (whitespace, tabs vs spaces)
 - File path wrong
 
-Look at the file content again, fix the patch, and respond with the SAME JSON
-shape: {"patch": "<corrected unified diff>"}. Output ONLY the JSON object."""
+Look at the file content again, fix the patch, return JSON: {"patch": "<corrected diff>"}."""
 
 
 def _truncate(text: str, limit: int) -> str:
@@ -111,7 +121,6 @@ def _truncate(text: str, limit: int) -> str:
 
 
 def _extract_json_obj(response: str, key: str):
-    """Pull a JSON object containing the given key out of a model response."""
     if not response:
         return None
     response = response.strip()
@@ -140,6 +149,19 @@ def _extract_json_obj(response: str, key: str):
     return None
 
 
+def _extract_files_obj(response: str) -> dict[str, list[str]]:
+    """Extract {source_files, test_files} from response."""
+    sources = _extract_json_obj(response, "source_files") or []
+    tests = _extract_json_obj(response, "test_files") or []
+    if not isinstance(sources, list):
+        sources = []
+    if not isinstance(tests, list):
+        tests = []
+    sources = [s for s in sources if isinstance(s, str) and s.strip()][:NUM_SOURCE_FILES]
+    tests = [t for t in tests if isinstance(t, str) and t.strip()][:NUM_TEST_FILES]
+    return {"source": sources, "tests": tests}
+
+
 def _normalize_patch(patch: str) -> str:
     if not patch:
         return ""
@@ -149,15 +171,8 @@ def _normalize_patch(patch: str) -> str:
 
 
 def _run(cmd: list[str], input_data: str | None = None, timeout: int = EXEC_TIMEOUT) -> tuple[int, str, str]:
-    """Sync subprocess.run wrapper. Returns (returncode, stdout, stderr)."""
     try:
-        p = subprocess.run(
-            cmd,
-            input=input_data,
-            capture_output=True,
-            text=True,
-            timeout=timeout,
-        )
+        p = subprocess.run(cmd, input=input_data, capture_output=True, text=True, timeout=timeout)
         return p.returncode, p.stdout, p.stderr
     except subprocess.TimeoutExpired as e:
         return -1, e.stdout or "", f"[timeout after {timeout}s]"
@@ -180,163 +195,229 @@ class Agent:
 
         instance_id = task.get("instance_id", "?")
         image_uri = task.get("image_uri", "")
-        repo = task.get("repo", "")
         logger.info(f"[{instance_id}] start; image={image_uri}")
 
         await updater.update_status(
-            TaskState.working, new_agent_text_message(f"Starting {instance_id}...")
+            TaskState.working, new_agent_text_message(f"Starting {instance_id}")
         )
 
         patch = ""
         container_name = f"swebench-{uuid.uuid4().hex[:12]}"
 
         try:
-            if image_uri:
-                started = await self._start_container(image_uri, container_name, updater)
-                if started:
-                    patch = await self._explore_and_patch(task, container_name, updater)
-                else:
-                    logger.warning(f"[{instance_id}] failed to start container, falling back")
-                    patch = await self._blind_patch(task)
+            if image_uri and await self._start_container(image_uri, container_name, updater):
+                patch = await self._iterate_to_patch(task, container_name, updater)
             else:
                 patch = await self._blind_patch(task)
         except Exception as e:
-            logger.exception(f"[{instance_id}] unexpected error: {e}")
+            logger.exception(f"[{instance_id}] unexpected: {e}")
         finally:
             await asyncio.to_thread(_run, ["docker", "rm", "-f", container_name], None, 30)
 
         patch = _normalize_patch(patch or "")
-        logger.info(f"[{instance_id}] final patch length: {len(patch)}")
+        logger.info(f"[{instance_id}] final patch len={len(patch)}")
 
         await updater.add_artifact(
             parts=[Part(root=TextPart(text=json.dumps({"patch": patch})))],
             name="Result",
         )
 
-    async def _start_container(self, image_uri: str, container_name: str, updater: TaskUpdater) -> bool:
+    async def _start_container(self, image_uri: str, name: str, updater: TaskUpdater) -> bool:
         await updater.update_status(
-            TaskState.working, new_agent_text_message(f"Pulling image {image_uri[:60]}...")
+            TaskState.working, new_agent_text_message(f"Pulling {image_uri[:50]}")
         )
         rc, _, err = await asyncio.to_thread(_run, ["docker", "pull", image_uri], None, 600)
         if rc != 0:
             logger.error(f"docker pull failed: {err[:300]}")
             return False
-
         rc, _, err = await asyncio.to_thread(
             _run,
-            [
-                "docker", "run", "-d", "--rm",
-                "--name", container_name,
-                "--network", "none",
-                image_uri,
-                "sleep", str(CONTAINER_LIFETIME_SEC),
-            ],
-            None,
-            60,
+            ["docker", "run", "-d", "--rm", "--name", name, "--network", "none",
+             image_uri, "sleep", str(CONTAINER_LIFETIME_SEC)],
+            None, 60,
         )
         if rc != 0:
             logger.error(f"docker run failed: {err[:300]}")
             return False
         return True
 
-    def _exec_in_container(self, container_name: str, cmd: list[str], timeout: int = EXEC_TIMEOUT) -> tuple[int, str, str]:
-        return _run(["docker", "exec", container_name, *cmd], None, timeout)
+    def _exec(self, name: str, cmd: list[str], timeout: int = EXEC_TIMEOUT) -> tuple[int, str, str]:
+        return _run(["docker", "exec", name, *cmd], None, timeout)
 
-    async def _explore_and_patch(self, task: dict, container_name: str, updater: TaskUpdater) -> str:
-        instance_id = task.get("instance_id", "?")
+    def _exec_input(self, name: str, cmd: list[str], stdin: str, timeout: int = EXEC_TIMEOUT) -> tuple[int, str, str]:
+        return _run(["docker", "exec", "-i", name, *cmd], stdin, timeout)
 
-        # Step 1: get repo file tree
-        await updater.update_status(
-            TaskState.working, new_agent_text_message(f"[{instance_id}] listing repo...")
+    async def _find_repo_root(self, name: str) -> str:
+        rc, _, _ = await asyncio.to_thread(self._exec, name, ["test", "-d", "/app/.git"], 10)
+        if rc == 0:
+            return "/app"
+        rc, out, _ = await asyncio.to_thread(
+            self._exec, name,
+            ["sh", "-c", "find / -maxdepth 4 -name '.git' -type d 2>/dev/null | head -1"],
+            30,
         )
-        # Many SWE-bench Pro images have the repo at /app; fall back to wherever .git lives
-        rc, _, _ = await asyncio.to_thread(self._exec_in_container, container_name, ["test", "-d", "/app/.git"], 10)
-        repo_root = "/app"
-        if rc != 0:
-            rc, out, _ = await asyncio.to_thread(
-                self._exec_in_container,
-                container_name,
-                ["sh", "-c", "find / -maxdepth 4 -name '.git' -type d 2>/dev/null | head -1"],
-                30,
-            )
-            if rc == 0 and out.strip():
-                repo_root = out.strip().replace("/.git", "")
-        logger.info(f"[{instance_id}] repo_root={repo_root}")
+        if rc == 0 and out.strip():
+            return out.strip().replace("/.git", "")
+        return "/app"
 
-        rc, tree_out, _ = await asyncio.to_thread(
-            self._exec_in_container,
-            container_name,
+    async def _list_files(self, name: str, repo_root: str) -> list[str]:
+        rc, out, _ = await asyncio.to_thread(
+            self._exec, name,
             ["sh", "-c", f"cd {repo_root} && git ls-files 2>/dev/null | head -800"],
             60,
         )
-        if rc != 0 or not tree_out.strip():
-            # Fallback to find
-            rc, tree_out, _ = await asyncio.to_thread(
-                self._exec_in_container,
-                container_name,
+        if rc != 0 or not out.strip():
+            rc, out, _ = await asyncio.to_thread(
+                self._exec, name,
                 ["sh", "-c", f"cd {repo_root} && find . -type f -not -path '*/node_modules/*' -not -path '*/.git/*' 2>/dev/null | head -800"],
                 60,
             )
-        file_lines = [l.strip() for l in tree_out.splitlines() if l.strip()]
-        if not file_lines:
-            logger.warning(f"[{instance_id}] empty file listing, fallback")
-            return await self._blind_patch(task)
-        file_tree = "\n".join(file_lines[:FILE_TREE_MAX_LINES])
+        return [l.strip() for l in out.splitlines() if l.strip()]
 
-        # Step 2: ask model to identify candidate files
-        candidates = await self._identify_files(task, file_tree)
-        if not candidates:
-            return await self._blind_patch(task)
-
-        # Step 3: read those files
-        await updater.update_status(
-            TaskState.working,
-            new_agent_text_message(f"[{instance_id}] reading {len(candidates)} files..."),
+    async def _read_file(self, name: str, repo_root: str, path: str) -> str:
+        safe = path.lstrip("./").replace("..", "")
+        rc, content, _ = await asyncio.to_thread(
+            self._exec, name, ["sh", "-c", f"cat {repo_root}/{safe}"], 30,
         )
-        file_contents: dict[str, str] = {}
-        for path in candidates[:NUM_CANDIDATE_FILES]:
-            safe_path = path.lstrip("./").replace("..", "")
-            rc, content, _ = await asyncio.to_thread(
-                self._exec_in_container,
-                container_name,
-                ["sh", "-c", f"cat {repo_root}/{safe_path}"],
-                30,
-            )
-            if rc == 0 and content:
-                file_contents[safe_path] = _truncate(content, FILE_CONTENT_MAX_CHARS)
-        if not file_contents:
-            logger.warning(f"[{instance_id}] no candidate file contents read")
-            return await self._blind_patch(task)
-
-        # Step 4: ask for the patch
-        await updater.update_status(
-            TaskState.working, new_agent_text_message(f"[{instance_id}] generating patch...")
-        )
-        patch = await self._generate_patch(task, file_contents)
-        if not patch:
+        if rc != 0:
             return ""
+        return _truncate(content, FILE_CONTENT_MAX_CHARS)
 
-        # Step 5: validate via git apply --check; one repair attempt
-        ok, err = await self._validate_patch(container_name, repo_root, patch)
-        if not ok:
-            logger.info(f"[{instance_id}] first patch invalid, attempting repair: {err[:200]}")
-            patch = await self._repair_patch(task, file_contents, patch, err)
-            if patch:
-                ok, err = await self._validate_patch(container_name, repo_root, patch)
-                if not ok:
-                    logger.info(f"[{instance_id}] repair also invalid: {err[:200]}")
-                    # Submit anyway — green will silently fail to apply but at least we tried.
-        return patch
-
-    async def _validate_patch(self, container_name: str, repo_root: str, patch: str) -> tuple[bool, str]:
-        cmd = [
-            "docker", "exec", "-i", container_name,
-            "sh", "-c", f"cd {repo_root} && git apply --check -",
-        ]
-        rc, _, err = await asyncio.to_thread(_run, cmd, patch, 60)
+    async def _validate_patch(self, name: str, repo_root: str, patch: str) -> tuple[bool, str]:
+        rc, _, err = await asyncio.to_thread(
+            self._exec_input, name,
+            ["sh", "-c", f"cd {repo_root} && git apply --check -"],
+            patch, 60,
+        )
         return rc == 0, err
 
-    async def _identify_files(self, task: dict, file_tree: str) -> list[str]:
+    async def _apply_patch(self, name: str, repo_root: str, patch: str) -> tuple[bool, str]:
+        rc, _, err = await asyncio.to_thread(
+            self._exec_input, name,
+            ["sh", "-c", f"cd {repo_root} && git apply -"],
+            patch, 60,
+        )
+        return rc == 0, err
+
+    async def _reset_repo(self, name: str, repo_root: str, base_commit: str):
+        target = base_commit if base_commit else "HEAD"
+        await asyncio.to_thread(
+            self._exec, name,
+            ["sh", "-c", f"cd {repo_root} && git reset --hard {target} 2>&1"],
+            60,
+        )
+
+    async def _run_tests(self, name: str, repo_root: str, test_files: list[str]) -> tuple[bool, str]:
+        """Try pytest on the test files. Return (all_passed, stdout+stderr)."""
+        if not test_files:
+            return True, ""  # no tests to run, treat as pass-through
+        files_arg = " ".join(f"'{repo_root}/{tf.lstrip('./')}'" for tf in test_files)
+        # -x stops on first fail; --tb=short shorter trace; -q quieter
+        cmd = f"cd {repo_root} && python -m pytest {files_arg} -x --tb=short -q 2>&1 | tail -200"
+        rc, out, err = await asyncio.to_thread(
+            self._exec, name, ["sh", "-c", cmd], TEST_RUN_TIMEOUT,
+        )
+        combined = (out + err).strip()
+        passed = rc == 0 and ("failed" not in combined.lower() or "0 failed" in combined.lower())
+        return passed, _truncate(combined, TEST_OUTPUT_MAX_CHARS)
+
+    async def _iterate_to_patch(self, task: dict, name: str, updater: TaskUpdater) -> str:
+        instance_id = task.get("instance_id", "?")
+        base_commit = task.get("base_commit", "")
+
+        # Find repo + list files
+        repo_root = await self._find_repo_root(name)
+        await updater.update_status(
+            TaskState.working, new_agent_text_message(f"[{instance_id}] listing repo")
+        )
+        all_files = await self._list_files(name, repo_root)
+        if not all_files:
+            return await self._blind_patch(task)
+        file_tree = "\n".join(all_files[:FILE_TREE_MAX_LINES])
+
+        # Identify source + test files
+        candidates = await self._identify_files(task, file_tree)
+        if not candidates["source"]:
+            return await self._blind_patch(task)
+        logger.info(f"[{instance_id}] source={candidates['source']} tests={candidates['tests']}")
+
+        # Read all candidate files
+        await updater.update_status(
+            TaskState.working,
+            new_agent_text_message(f"[{instance_id}] reading {len(candidates['source'])} src + {len(candidates['tests'])} tests"),
+        )
+        source_contents: dict[str, str] = {}
+        for p in candidates["source"]:
+            c = await self._read_file(name, repo_root, p)
+            if c:
+                source_contents[p] = c
+        test_contents: dict[str, str] = {}
+        for p in candidates["tests"]:
+            c = await self._read_file(name, repo_root, p)
+            if c:
+                test_contents[p] = c
+        if not source_contents:
+            return await self._blind_patch(task)
+
+        # Iteration loop
+        best_patch = ""
+        last_test_output = ""
+        for revision in range(MAX_REVISION_PASSES + 1):
+            await updater.update_status(
+                TaskState.working,
+                new_agent_text_message(f"[{instance_id}] generating patch (rev {revision})"),
+            )
+
+            if revision == 0:
+                patch = await self._generate_patch(task, source_contents, test_contents)
+            else:
+                patch = await self._revise_patch(
+                    task, source_contents, test_contents, best_patch, last_test_output,
+                )
+            if not patch:
+                break
+
+            # Validate patch syntactically
+            ok, err = await self._validate_patch(name, repo_root, patch)
+            if not ok:
+                logger.info(f"[{instance_id}] rev{revision} apply --check failed: {err[:120]}")
+                # one syntactic repair attempt
+                patch = await self._repair_patch(task, source_contents, patch, err)
+                if not patch:
+                    continue
+                ok, err = await self._validate_patch(name, repo_root, patch)
+                if not ok:
+                    # Save as best so far (might still apply with --3way somewhere)
+                    if not best_patch:
+                        best_patch = patch
+                    continue
+
+            best_patch = patch  # latest validating patch wins
+
+            # If we have test files, actually run them
+            if test_contents:
+                await self._reset_repo(name, repo_root, base_commit)
+                applied_ok, apply_err = await self._apply_patch(name, repo_root, patch)
+                if not applied_ok:
+                    logger.info(f"[{instance_id}] rev{revision} apply failed at runtime: {apply_err[:120]}")
+                    last_test_output = f"git apply error:\n{apply_err}"
+                    continue
+                await updater.update_status(
+                    TaskState.working,
+                    new_agent_text_message(f"[{instance_id}] running tests (rev {revision})"),
+                )
+                passed, output = await self._run_tests(name, repo_root, list(test_contents.keys()))
+                logger.info(f"[{instance_id}] rev{revision} tests passed={passed}")
+                if passed:
+                    return patch
+                last_test_output = output
+            else:
+                # No tests to verify with; submit current patch
+                return patch
+
+        return best_patch
+
+    async def _identify_files(self, task: dict, file_tree: str) -> dict[str, list[str]]:
         problem = _truncate((task.get("problem_statement") or "").strip(), PROBLEM_MAX_CHARS)
         hints = _truncate((task.get("hints") or task.get("hints_text") or "").strip(), HINTS_MAX_CHARS)
         repo = task.get("repo", "").strip()
@@ -345,55 +426,61 @@ class Agent:
             f"## Issue\n\n{problem}\n\n"
             + (f"## Hints\n\n{hints}\n\n" if hints else "")
             + f"## Repo file tree\n\n{file_tree}\n\n"
-            "Which 1-4 files most likely contain the bug?"
+            "Pick source files (where the bug lives) and test files (that exercise it)."
         )
         resp = await self._call_model(SYSTEM_FILE_ID, user)
-        files = _extract_json_obj(resp, "files")
-        if isinstance(files, list):
-            return [f for f in files if isinstance(f, str) and f.strip()][:NUM_CANDIDATE_FILES]
-        return []
+        return _extract_files_obj(resp)
 
-    async def _generate_patch(self, task: dict, file_contents: dict[str, str]) -> str:
+    async def _generate_patch(self, task: dict, sources: dict[str, str], tests: dict[str, str]) -> str:
         problem = _truncate((task.get("problem_statement") or "").strip(), PROBLEM_MAX_CHARS)
         hints = _truncate((task.get("hints") or task.get("hints_text") or "").strip(), HINTS_MAX_CHARS)
         repo = task.get("repo", "").strip()
-
-        files_section = []
-        for path, content in file_contents.items():
-            files_section.append(f"### {path}\n```\n{content}\n```")
-        files_block = "\n\n".join(files_section)
-
+        src_block = "\n\n".join(f"### {p}\n```\n{c}\n```" for p, c in sources.items())
+        tst_block = "\n\n".join(f"### {p}\n```\n{c}\n```" for p, c in tests.items())
         user = (
             f"Repository: {repo}\n\n"
             f"## Issue\n\n{problem}\n\n"
             + (f"## Hints\n\n{hints}\n\n" if hints else "")
-            + f"## File contents\n\n{files_block}\n\n"
-            "Produce the unified-diff patch as JSON: {\"patch\": \"<diff>\"}"
+            + f"## Source files\n\n{src_block}\n\n"
+            + (f"## Test files (expected behavior)\n\n{tst_block}\n\n" if tst_block else "")
+            + 'Produce the patch as JSON: {"patch": "<diff>"}'
         )
         resp = await self._call_model(SYSTEM_PATCH_GEN, user)
         patch = _extract_json_obj(resp, "patch")
         return patch if isinstance(patch, str) else ""
 
-    async def _repair_patch(self, task: dict, file_contents: dict[str, str], bad_patch: str, error: str) -> str:
+    async def _revise_patch(self, task: dict, sources: dict[str, str], tests: dict[str, str],
+                            prev_patch: str, test_output: str) -> str:
         problem = _truncate((task.get("problem_statement") or "").strip(), PROBLEM_MAX_CHARS)
-        files_section = []
-        for path, content in file_contents.items():
-            files_section.append(f"### {path}\n```\n{content}\n```")
-        files_block = "\n\n".join(files_section)
-
+        src_block = "\n\n".join(f"### {p}\n```\n{c}\n```" for p, c in sources.items())
+        tst_block = "\n\n".join(f"### {p}\n```\n{c}\n```" for p, c in tests.items())
         user = (
             f"## Issue\n\n{problem}\n\n"
-            f"## File contents\n\n{files_block}\n\n"
-            f"## Failed patch\n\n```\n{bad_patch}\n```\n\n"
-            f"## git apply error\n\n{_truncate(error, 1500)}\n\n"
-            "Fix the patch and return JSON: {\"patch\": \"<corrected diff>\"}"
+            f"## Source files\n\n{src_block}\n\n"
+            + (f"## Test files\n\n{tst_block}\n\n" if tst_block else "")
+            + f"## Your previous patch\n\n```\n{prev_patch}\n```\n\n"
+            + f"## Test failure output\n\n```\n{_truncate(test_output, TEST_OUTPUT_MAX_CHARS)}\n```\n\n"
+            'Produce a revised patch as JSON: {"patch": "<corrected diff>"}'
+        )
+        resp = await self._call_model(SYSTEM_PATCH_REVISE, user)
+        patch = _extract_json_obj(resp, "patch")
+        return patch if isinstance(patch, str) else ""
+
+    async def _repair_patch(self, task: dict, sources: dict[str, str], bad: str, err: str) -> str:
+        problem = _truncate((task.get("problem_statement") or "").strip(), PROBLEM_MAX_CHARS)
+        src_block = "\n\n".join(f"### {p}\n```\n{c}\n```" for p, c in sources.items())
+        user = (
+            f"## Issue\n\n{problem}\n\n"
+            f"## Source files\n\n{src_block}\n\n"
+            f"## Failed patch\n\n```\n{bad}\n```\n\n"
+            f"## git apply error\n\n```\n{_truncate(err, 1500)}\n```\n\n"
+            'Fix and return JSON: {"patch": "<corrected diff>"}'
         )
         resp = await self._call_model(SYSTEM_PATCH_REPAIR, user)
         patch = _extract_json_obj(resp, "patch")
         return patch if isinstance(patch, str) else ""
 
     async def _blind_patch(self, task: dict) -> str:
-        """Fallback when we can't pull/start the container — best-effort patch from issue alone."""
         problem = _truncate((task.get("problem_statement") or "").strip(), PROBLEM_MAX_CHARS)
         hints = _truncate((task.get("hints") or task.get("hints_text") or "").strip(), HINTS_MAX_CHARS)
         repo = task.get("repo", "").strip()
@@ -401,15 +488,14 @@ class Agent:
             f"Repository: {repo}\n\n"
             f"## Issue\n\n{problem}\n\n"
             + (f"## Hints\n\n{hints}\n\n" if hints else "")
-            + "Container access failed; produce best-effort patch from issue alone. "
-            "Return JSON: {\"patch\": \"<diff>\"}"
+            + 'Container access failed; best-effort patch from issue alone. Return JSON: {"patch": "<diff>"}'
         )
         resp = await self._call_model(SYSTEM_PATCH_GEN, user)
         patch = _extract_json_obj(resp, "patch")
         return patch if isinstance(patch, str) else ""
 
     async def _call_model(self, system_prompt: str, user_prompt: str) -> str:
-        await asyncio.sleep(random.uniform(0, 3))  # spread shard fan-out
+        await asyncio.sleep(random.uniform(0, 5))  # spread shard fan-out
 
         system_msg = {
             "role": "system",
