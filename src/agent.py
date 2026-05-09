@@ -465,13 +465,24 @@ class Agent:
                 )
             except Exception as e:
                 err = str(e)
-                if any(s in err for s in ("503", "overloaded", "429", "rate limit", "rate_limit")):
+                err_l = err.lower()
+                # Retryable transient errors. NOTE: "exceeded your current quota" is NOT
+                # retryable (account is out of credits) — surface it as a hard error.
+                is_quota_exhausted = "exceeded your current quota" in err_l
+                is_retryable = (
+                    not is_quota_exhausted
+                    and any(s in err_l for s in (
+                        "503", "overloaded", "429", "rate limit", "rate_limit",
+                        "ratelimit", "tpm", "rpm", "tokens per minute", "requests per minute",
+                    ))
+                )
+                if is_retryable:
                     base = min(RETRY_BACKOFF_CAP, 5 * (2 ** min(step, 3)))
                     wait = base + random.uniform(0, base * 0.3)
-                    logger.warning(f"[{instance_id}] step {step} LLM rate-limited: waiting {wait:.1f}s")
+                    logger.warning(f"[{instance_id}] step {step} transient LLM error, waiting {wait:.1f}s: {err[:200]}")
                     await asyncio.sleep(wait)
                     continue
-                logger.error(f"[{instance_id}] step {step} LLM error: {err[:300]}")
+                logger.error(f"[{instance_id}] step {step} LLM error (not retryable): {err[:300]}")
                 break
 
             msg = completion.choices[0].message
