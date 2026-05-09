@@ -42,7 +42,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-MODEL = "openai/gpt-4o-mini"
+MODEL = "openai/gpt-4o"
 MAX_TOKENS = 4096
 
 # Resource caps
