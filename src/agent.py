@@ -21,6 +21,7 @@ import logging
 import random
 import re
 import subprocess
+import sys
 import uuid
 
 from a2a.server.tasks import TaskUpdater
@@ -33,6 +34,12 @@ from dotenv import load_dotenv
 from messenger import Messenger
 
 load_dotenv()
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(name)s %(levelname)s %(message)s",
+    stream=sys.stderr,
+    force=True,
+)
 logger = logging.getLogger(__name__)
 
 MODEL = "openai/gpt-4o-mini"
@@ -223,12 +230,21 @@ class Agent:
         )
 
     async def _start_container(self, image_uri: str, name: str, updater: TaskUpdater) -> bool:
+        # First: prove docker CLI is reachable inside our container.
+        rc, vout, verr = await asyncio.to_thread(_run, ["docker", "version", "--format", "{{.Client.Version}} / {{.Server.Version}}"], None, 15)
+        logger.info(f"docker version rc={rc} out={vout.strip()!r} err={verr[:200]!r}")
+        if rc != 0:
+            logger.error(f"docker CLI not reachable; falling back to blind patch")
+            return False
+
         await updater.update_status(
             TaskState.working, new_agent_text_message(f"Pulling {image_uri[:50]}")
         )
-        rc, _, err = await asyncio.to_thread(_run, ["docker", "pull", image_uri], None, 600)
+        logger.info(f"docker pull image={image_uri!r}")
+        rc, pout, err = await asyncio.to_thread(_run, ["docker", "pull", image_uri], None, 600)
+        logger.info(f"docker pull rc={rc} stdout_tail={pout[-200:]!r} stderr_tail={err[-200:]!r}")
         if rc != 0:
-            logger.error(f"docker pull failed: {err[:300]}")
+            logger.error(f"docker pull failed: {err[:500]}")
             return False
         rc, _, err = await asyncio.to_thread(
             _run,
