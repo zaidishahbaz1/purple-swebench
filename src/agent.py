@@ -460,11 +460,11 @@ class Agent:
                     temperature=0,
                     max_tokens=ROOT_MAX_TOKENS,
                     tools=TOOLS,
-                    tool_choice="auto",
+                    tool_choice="required",  # force a tool call every step
                 )
             except Exception as e:
                 err = str(e)
-                if any(s in err for s in ("503", "overloaded", "429", "rate", "limit")):
+                if any(s in err for s in ("503", "overloaded", "429", "rate limit", "rate_limit")):
                     base = min(RETRY_BACKOFF_CAP, 5 * (2 ** min(step, 3)))
                     wait = base + random.uniform(0, base * 0.3)
                     logger.warning(f"[{instance_id}] step {step} LLM rate-limited: waiting {wait:.1f}s")
@@ -488,9 +488,15 @@ class Agent:
             history.append(assistant_msg)
 
             if not tool_calls:
-                # Model gave free text instead of a tool call. Nudge it.
+                # With tool_choice="required" this should be rare, but defend.
+                logger.warning(f"[{instance_id}] step {step}: no tool_calls in response, content={(msg.content or '')[:200]!r}")
                 history.append({"role": "user", "content": "Call exactly one of bash, repl, or final."})
                 continue
+
+            logger.info(
+                f"[{instance_id}] step {step}: tool={tool_calls[0].function.name} "
+                f"args={(tool_calls[0].function.arguments or '')[:200]!r}"
+            )
 
             # We act on the first tool call only; respond to all to satisfy API.
             primary = tool_calls[0]
