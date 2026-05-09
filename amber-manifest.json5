@@ -5,13 +5,13 @@
   config_schema: {
     type: "object",
     properties: {
-      anthropic_api_key: {
+      openai_api_key: {
         type: "string",
-        title: "Anthropic API Key",
+        title: "OpenAI API Key",
         secret: true,
       },
     },
-    required: ["anthropic_api_key"],
+    required: ["openai_api_key"],
     additionalProperties: false,
   },
   program: {
@@ -19,7 +19,7 @@
     entrypoint: "uv run --no-sync src/server.py --host 0.0.0.0 --port 9009",
     env: {
       PYTHONUNBUFFERED: "1",
-      ANTHROPIC_API_KEY: "${config.anthropic_api_key}",
+      OPENAI_API_KEY: "${config.openai_api_key}",
     },
     network: {
       endpoints: [

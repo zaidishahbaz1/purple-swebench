@@ -35,7 +35,7 @@ from messenger import Messenger
 load_dotenv()
 logger = logging.getLogger(__name__)
 
-MODEL = "anthropic/claude-haiku-4-5-20251001"
+MODEL = "openai/gpt-4o-mini"
 MAX_TOKENS = 4096
 
 # Resource caps
@@ -497,12 +497,8 @@ class Agent:
     async def _call_model(self, system_prompt: str, user_prompt: str) -> str:
         await asyncio.sleep(random.uniform(0, 5))  # spread shard fan-out
 
-        system_msg = {
-            "role": "system",
-            "content": [
-                {"type": "text", "text": system_prompt, "cache_control": {"type": "ephemeral"}}
-            ],
-        }
+        # OpenAI auto-caches prefixes >1024 tokens server-side; no cache_control marker needed.
+        system_msg = {"role": "system", "content": system_prompt}
         user_msg = {"role": "user", "content": user_prompt}
 
         for attempt in range(RETRY_MAX_ATTEMPTS):
