@@ -201,8 +201,10 @@ class Agent:
             task = {"problem_statement": input_text}
 
         instance_id = task.get("instance_id", "?")
-        image_uri = task.get("image_uri", "")
-        logger.info(f"[{instance_id}] start; image={image_uri}")
+        # The green sends the docker image under different field names depending on
+        # version. Accept both. Also log the available keys so misnamings show up.
+        image_uri = task.get("docker_image") or task.get("image_uri") or task.get("image") or ""
+        logger.info(f"[{instance_id}] start; image={image_uri!r}; task_keys={list(task.keys())}")
 
         await updater.update_status(
             TaskState.working, new_agent_text_message(f"Starting {instance_id}")
