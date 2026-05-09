@@ -335,14 +335,15 @@ class Agent:
             logger.error(f"[{instance_id}] docker pull failed: {err[-500:]}")
             return False
 
-        # Default network (bridge) — many SWE-bench tests need it. The actual
-        # scoring container in green uses default network too, so our
-        # exploration matches eval behavior.
+        # SWE-bench Pro images are amd64. Force platform so this works on
+        # both x86_64 (GitHub Actions runners) and arm64 (Apple Silicon
+        # local dev) hosts. Default network (bridge) — many tests need it.
         rc, _, err = await asyncio.to_thread(
             _run,
             [
                 "docker", "run", "-d", "--rm",
                 "--name", name,
+                "--platform", "linux/amd64",
                 image_uri,
                 "sleep", str(CONTAINER_LIFETIME_SEC),
             ],
@@ -503,9 +504,11 @@ class Agent:
             extras = tool_calls[1:]
 
             name = primary.function.name
+            raw_args = primary.function.arguments or "{}"
             try:
-                args = json.loads(primary.function.arguments or "{}")
-            except json.JSONDecodeError:
+                args = json.loads(raw_args)
+            except json.JSONDecodeError as e:
+                logger.warning(f"[{instance_id}] step {step}: JSON parse failed for args: {e}; raw={raw_args[:300]!r}")
                 args = {}
 
             tool_result_text = ""
@@ -549,6 +552,7 @@ class Agent:
                 else:
                     cmd = str(args.get("command", "")).strip()
                     if not cmd:
+                        logger.warning(f"[{instance_id}] step {step}: bash got empty command; args={args!r}")
                         tool_result_text = "[empty command]"
                     else:
                         tmo = args.get("timeout", 30)
@@ -557,10 +561,12 @@ class Agent:
                         except (TypeError, ValueError):
                             tmo = 30
                         bash_count += 1
+                        logger.info(f"[{instance_id}] step {step}: executing bash {cmd[:200]!r}")
                         rc, out, err = await asyncio.to_thread(
                             self._exec_input, container_name,
                             ["sh", "-c", f"cd {repo_root} && {cmd}"], "", tmo,
                         )
+                        logger.info(f"[{instance_id}] step {step}: bash done rc={rc} stdout_len={len(out)} stderr_len={len(err)}")
                         # Store full in transcript
                         transcript.append({
                             "kind": "bash",
