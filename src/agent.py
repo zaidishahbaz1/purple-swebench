@@ -105,19 +105,39 @@ You are inside a sandbox that has the repository checked out at /app, at the exa
    If invalid, you'll see the error and you must revise (call final again with
    a fixed patch). On valid, the task is done.
 
-WORKING MEMORY MODEL (RLM):
-The chat history accumulates fast on hard tasks. Long file contents and test
-outputs are kept in the `context` REPL variable rather than your prompt. Pull
-slices via repl. Summarize via llm_query. Example:
+WORKING MEMORY MODEL (RLM — Recursive Language Models):
+The chat history accumulates fast on hard tasks. **Long file contents and test
+outputs are kept in the `context` REPL list, NOT in your chat prompt.** Pull
+slices via repl. Summarize via llm_query.
 
+Concrete worked example. Suppose you've just done:
+  bash("cat src/middleware/auth.py")     # 60KB file, you only saw 6KB truncated
+  bash("python -m pytest tests/test_auth.py -v")   # 30KB pytest output
+
+To dig into the truncated file content WITHOUT another bash call, use repl:
 ```python
-# repl call
-recent = context[-3:]
-print(recent[0]['stdout'][:3000])
-# Or summarize a giant test output:
-gist = llm_query(f"What test failed and why?\\n\\n{context[-1]['stdout']}")
-print(gist)
+# Pull the auth.py content out of context (the cat result lives at index -2)
+auth_src = context[-2]['stdout']
+# Find the buggy function by searching for keywords from the issue
+import re
+for m in re.finditer(r'def (validate_token|check_session)', auth_src):
+    start = m.start()
+    print(auth_src[max(0, start-100):start+800])
+    print('---')
 ```
+
+Or summarize a huge pytest dump that's overflowing chat:
+```python
+test_log = context[-1]['stdout']
+summary = llm_query(
+    "Identify the failing assertion and the relevant traceback frames "
+    "(file:line, function name) from this pytest output:\\n\\n" + test_log
+)
+print(summary)
+```
+
+These repl calls cost you ZERO bash budget and don't add long content to your
+chat history. Use them aggressively.
 
 DEBUGGING WORKFLOW (the way humans solve these):
 - Read the issue carefully. Identify symptom, expected behavior, key terms.
@@ -210,9 +230,28 @@ def _truncate(s: str, n: int = LLM_OBS_TRUNCATE) -> str:
     return f"{s[:half]}\n... [TRUNCATED {len(s) - 2 * half} chars; full in context[-1]] ...\n{s[-half:]}"
 
 
+def _maybe_unescape_patch(patch: str) -> str:
+    """Some models double-escape newlines in tool-call args, sending '\\n' (literal
+    backslash-n) instead of real newlines. Detect and fix.
+    """
+    if not patch:
+        return patch
+    # Real newlines present? Already correct.
+    if "\n" in patch:
+        return patch
+    # No real newlines but obvious diff structure with escapes? Unescape.
+    if "\\n" in patch and ("diff --git" in patch or "@@" in patch or "--- " in patch):
+        try:
+            return patch.encode("utf-8").decode("unicode_escape")
+        except (UnicodeDecodeError, UnicodeEncodeError):
+            return patch
+    return patch
+
+
 def _normalize_patch(patch: str) -> str:
     if not patch:
         return ""
+    patch = _maybe_unescape_patch(patch)
     if not patch.endswith("\n"):
         patch += "\n"
     return patch
@@ -296,12 +335,14 @@ class Agent:
             logger.error(f"[{instance_id}] docker pull failed: {err[-500:]}")
             return False
 
+        # Default network (bridge) — many SWE-bench tests need it. The actual
+        # scoring container in green uses default network too, so our
+        # exploration matches eval behavior.
         rc, _, err = await asyncio.to_thread(
             _run,
             [
                 "docker", "run", "-d", "--rm",
                 "--name", name,
-                "--network", "none",
                 image_uri,
                 "sleep", str(CONTAINER_LIFETIME_SEC),
             ],
