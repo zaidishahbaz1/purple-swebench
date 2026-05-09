@@ -21,6 +21,9 @@
       PYTHONUNBUFFERED: "1",
       OPENAI_API_KEY: "${config.openai_api_key}",
     },
+    mounts: [
+      { path: "/var/run/docker.sock", from: "framework.docker" },
+    ],
     network: {
       endpoints: [
         { name: "endpoint", port: 9009 },
