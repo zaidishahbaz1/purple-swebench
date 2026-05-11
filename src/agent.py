@@ -338,17 +338,20 @@ class Agent:
             logger.error(f"[{instance_id}] docker pull failed: {err[-500:]}")
             return False
 
-        # SWE-bench Pro images are amd64. Force platform so this works on
-        # both x86_64 (GitHub Actions runners) and arm64 (Apple Silicon
-        # local dev) hosts. Default network (bridge) — many tests need it.
+        # SWE-bench Pro images set ENTRYPOINT=/bin/bash, which means our
+        # `sleep N` arg gets passed as a script name to bash and the
+        # container exits immediately. Override the entrypoint to /bin/sh
+        # so `sleep N` runs as the actual command. Also force linux/amd64
+        # for arm64 hosts. Default network (many tests need it).
         rc, _, err = await asyncio.to_thread(
             _run,
             [
                 "docker", "run", "-d", "--rm",
                 "--name", name,
                 "--platform", "linux/amd64",
+                "--entrypoint", "/bin/sh",
                 image_uri,
-                "sleep", str(CONTAINER_LIFETIME_SEC),
+                "-c", f"sleep {CONTAINER_LIFETIME_SEC}",
             ],
             None,
             60,
