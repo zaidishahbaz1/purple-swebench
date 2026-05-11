@@ -4,13 +4,15 @@ A purple (attacker-side) agent for the [AgentBeats](https://agentbeats.org) **Co
 
 ## Abstract
 
-We implement a **Recursive Language Model (RLM)** scaffold around a single-shot patch-generation protocol. Our root agent runs a ReAct loop with three tools:
+This agent is a direct application of **Recursive Language Models (RLM)** — the inference strategy introduced by Zhang, Khattab, and Kraska (MIT CSAIL, 2025) in [_Recursive Language Models_](https://arxiv.org/abs/2512.24601). RLM lets a root LM decompose long-context work by handing chunks to a recursive `llm_query()` call inside a Python interpreter, instead of cramming everything into one window. We adopt that pattern wholesale and wrap it around the SWE-bench Pro single-shot patch-generation protocol.
+
+Our root agent (`gpt-4o`) runs a ReAct loop with three tools:
 
 - **`bash`** — execute commands inside a sidecar container spawned from the task's Docker image, giving the model a real shell over the buggy repo (read files, grep, run git, try edits, validate with `git apply --check`).
-- **`repl`** — a persistent Python REPL where intermediate state (file contents, search results, candidate patches) is stashed in a `context` variable that survives across turns. This is the key idea from [Recursive Language Models](https://arxiv.org/abs/2512.24601) (Zhang, Khattab, Kraska — MIT CSAIL, 2025): instead of stuffing everything into a single context window, the agent decomposes work and offloads bulky intermediate state to an interpreter-managed environment.
+- **`repl`** — a persistent Python REPL where intermediate state (file contents, search results, candidate patches) is stashed in a `context` variable that survives across turns. This is the RLM scratchpad: bulky intermediate state lives in the interpreter rather than the root LM's window.
 - **`final`** — emit the final unified diff as the task artifact.
 
-Inside the REPL the model can call **`llm_query(prompt, content)`**, which dispatches to a cheaper sub-LLM (`gpt-4o-mini`). This lets the root model (`gpt-4o`) hand off large-context grunt work — "find the function that does X in this 5K-line file", "summarize this stack trace" — without paying the token cost of pulling that content into its own window. Recursion is bounded (`MAX_REPL=20`, `MAX_BASH=30`, `MAX_INNER_STEPS=30`) and every sub-call is logged.
+Inside the REPL the model can call **`llm_query(prompt, content)`** — this is the RLM recursive call. It dispatches to a cheaper sub-LLM (`gpt-4o-mini`) and lets the root model hand off large-context grunt work — "find the function that does X in this 5K-line file", "summarize this stack trace" — without paying the token cost of pulling that content into its own window. Recursion is bounded (`MAX_REPL=20`, `MAX_BASH=30`, `MAX_INNER_STEPS=30`) and every sub-call is logged.
 
 The result is an agent that behaves like a small engineering team: a planner with bash access, a scratchpad for state, and a junior assistant on call for bulk reads.
 
@@ -77,10 +79,19 @@ Deployed via Amber manifest (`amber-manifest.json5`) and submitted through the [
 
 ## Citation
 
-The recursive-LM scaffold here draws on:
+This work is a direct application of Recursive Language Models. If you build on this agent, please cite the original paper:
 
-> Alex Zhang, Omar Khattab, Tim Kraska. *Recursive Language Models.* arXiv:2512.24601, MIT CSAIL, 2025.
+```bibtex
+@article{zhang2025recursive,
+  title   = {Recursive Language Models},
+  author  = {Zhang, Alex and Khattab, Omar and Kraska, Tim},
+  journal = {arXiv preprint arXiv:2512.24601},
+  year    = {2025},
+  institution = {MIT CSAIL},
+  url     = {https://arxiv.org/abs/2512.24601},
+}
+```
 
 ## Acknowledgments
 
-Built on the [RDI-Foundation/agent-template](https://github.com/RDI-Foundation/agent-template). Evaluated on [SWE-bench Pro](https://github.com/scaleapi/SWE-bench_Pro-os) by Scale AI.
+Built on the [RDI-Foundation/agent-template](https://github.com/RDI-Foundation/agent-template). Evaluated on [SWE-bench Pro](https://github.com/scaleapi/SWE-bench_Pro-os) by Scale AI. Architecture inspired by [Recursive Language Models](https://arxiv.org/abs/2512.24601) (Zhang, Khattab, Kraska — MIT CSAIL, 2025).
