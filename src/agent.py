@@ -310,9 +310,12 @@ class Agent:
         patch = _normalize_patch(patch or "")
         logger.info(f"[{instance_id}] DONE patch_len={len(patch)}")
 
+        # Match the convention other purple agents use: artifact name "patch",
+        # raw diff as the text payload. Green's _extract_patch accepts either
+        # this or our previous JSON-wrapped form, but this is the canonical shape.
         await updater.add_artifact(
-            parts=[Part(root=TextPart(text=json.dumps({"patch": patch})))],
-            name="Result",
+            parts=[Part(root=TextPart(text=patch))],
+            name="patch",
         )
 
     # ------------------------------------------------------------------
