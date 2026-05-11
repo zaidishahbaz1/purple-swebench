@@ -357,6 +357,17 @@ class Agent:
             logger.error(f"[{instance_id}] docker run failed: {err[:500]}")
             return False
         logger.info(f"[{instance_id}] container started: {name}")
+
+        # Sanity probe: run a trivial command inside and log result. If this
+        # fails with "cannot execute binary file" we have a platform mismatch.
+        # If it fails with permission/network errors we see them once instead
+        # of buried inside every step's stderr.
+        rc2, sout, serr = await asyncio.to_thread(
+            self._exec, name, ["sh", "-c", "uname -a && id && ls /app | head -5"], 30,
+        )
+        logger.info(
+            f"[{instance_id}] probe rc={rc2} stdout={sout[:300]!r} stderr={serr[:300]!r}"
+        )
         return True
 
     def _exec(self, name: str, cmd: list[str], timeout: int = EXEC_TIMEOUT) -> tuple[int, str, str]:
@@ -580,6 +591,11 @@ class Agent:
                             self._exec_input, container_name,
                             ["sh", "-c", f"cd {repo_root} && {cmd}"], "", tmo,
                         )
+                        # Log the actual error content so we can see WHY bash failed
+                        if rc != 0 or err:
+                            logger.warning(
+                                f"[{instance_id}] step {step}: bash rc={rc} stderr={err[:500]!r}"
+                            )
                         logger.info(f"[{instance_id}] step {step}: bash done rc={rc} stdout_len={len(out)} stderr_len={len(err)}")
                         # Store full in transcript
                         transcript.append({
